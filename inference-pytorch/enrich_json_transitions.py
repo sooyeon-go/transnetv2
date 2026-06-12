@@ -97,6 +97,56 @@ def progress_path_for(output_path: str) -> str:
     return output_path + ".progress.json"
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = int(round(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def load_previous_elapsed(progress_path: str, resume: bool) -> float:
+    if not resume or not os.path.isfile(progress_path):
+        return 0.0
+    with open(progress_path) as f:
+        prev = json.load(f)
+    if prev.get("status") == "done":
+        return float(prev.get("accumulated_elapsed_seconds", prev.get("elapsed_seconds", 0)))
+    return float(prev.get("accumulated_elapsed_seconds", 0))
+
+
+def build_timing_info(
+    started_at: float,
+    started_at_iso: str,
+    previous_elapsed: float,
+    done_in_batch: int,
+    status: str,
+) -> Dict[str, Any]:
+    now = time.time()
+    elapsed_this_run = max(now - started_at, 0.0)
+    accumulated = previous_elapsed + elapsed_this_run
+    rate = done_in_batch / elapsed_this_run if elapsed_this_run > 0 else 0.0
+
+    info = {
+        "status": status,
+        "started_at": started_at_iso,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds_this_run": round(elapsed_this_run, 1),
+        "accumulated_elapsed_seconds": round(accumulated, 1),
+        "elapsed_human": format_duration(accumulated),
+        "elapsed_this_run_human": format_duration(elapsed_this_run),
+        "videos_per_second_this_run": round(rate, 3),
+    }
+    if status == "done":
+        info["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return info
+
+
 def write_progress_file(
     progress_path: str,
     output_path: str,
@@ -107,19 +157,24 @@ def write_progress_file(
     skipped: int,
     done_in_batch: int,
     started_at: float,
+    started_at_iso: str,
+    previous_elapsed: float,
     status: str = "running",
-) -> None:
+) -> Dict[str, Any]:
     finished = skipped + processed + failed
     percent = (finished / total * 100.0) if total else 100.0
     batch_percent = (done_in_batch / pending_total * 100.0) if pending_total else 100.0
-    elapsed = max(time.time() - started_at, 1e-6)
-    rate = done_in_batch / elapsed
+    elapsed_this_run = max(time.time() - started_at, 1e-6)
+    accumulated = previous_elapsed + elapsed_this_run
+    rate = done_in_batch / elapsed_this_run
     remaining = pending_total - done_in_batch
     eta_seconds = int(remaining / rate) if rate > 0 else None
 
+    timing = build_timing_info(
+        started_at, started_at_iso, previous_elapsed, done_in_batch, status
+    )
     payload = {
-        "status": status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        **timing,
         "json_path": output_path,
         "total_videos": total,
         "pending_this_run": pending_total,
@@ -131,11 +186,11 @@ def write_progress_file(
         "remaining_total": max(total - finished, 0),
         "percent_total": round(percent, 2),
         "percent_this_run": round(batch_percent, 2),
-        "videos_per_second": round(rate, 3),
-        "elapsed_seconds": int(elapsed),
         "eta_seconds": eta_seconds,
+        "eta_human": format_duration(eta_seconds),
     }
     atomic_write_json(payload, progress_path)
+    return payload
 
 
 def report_progress(
@@ -149,14 +204,25 @@ def report_progress(
     skipped: int,
     done_in_batch: int,
     started_at: float,
+    started_at_iso: str,
+    previous_elapsed: float,
     save_every: int,
     label: str,
     status: str = "running",
 ) -> None:
-    write_progress_file(
+    progress = write_progress_file(
         progress_path, output_path, total, pending_total,
-        processed, failed, skipped, done_in_batch, started_at, status=status,
+        processed, failed, skipped, done_in_batch,
+        started_at, started_at_iso, previous_elapsed, status=status,
     )
+    data["transition_scoring_timing"] = {
+        k: progress[k] for k in (
+            "status", "started_at", "updated_at", "finished_at",
+            "elapsed_seconds_this_run", "accumulated_elapsed_seconds",
+            "elapsed_human", "elapsed_this_run_human",
+            "videos_per_second_this_run", "eta_seconds", "eta_human",
+        ) if k in progress
+    }
 
     if done_in_batch % 100 != 0 and done_in_batch != pending_total:
         return
@@ -165,7 +231,8 @@ def report_progress(
         f"[enrich] progress {label} "
         f"run={done_in_batch}/{pending_total}, "
         f"total={skipped + processed + failed}/{total}, "
-        f"processed={processed}, skipped={skipped}, failed={failed}",
+        f"processed={processed}, skipped={skipped}, failed={failed}, "
+        f"elapsed={progress['elapsed_human']}, eta={progress.get('eta_human', 'unknown')}",
         flush=True,
     )
 
@@ -252,6 +319,8 @@ def enrich_json_single_gpu(
     output_path: str,
     progress_path: str,
     started_at: float,
+    started_at_iso: str,
+    previous_elapsed: float,
     predictor: TransNetV2Predictor,
     threshold: float,
     default_max_frames: Optional[int],
@@ -267,7 +336,8 @@ def enrich_json_single_gpu(
     print(f"[enrich] single-GPU mode ({pending_total} videos to score)", flush=True)
     write_progress_file(
         progress_path, output_path, total, pending_total,
-        processed, failed, skipped, 0, started_at, status="running",
+        processed, failed, skipped, 0,
+        started_at, started_at_iso, previous_elapsed, status="running",
     )
 
     for idx, (video_key, video_path, max_frames) in enumerate(pending, start=1):
@@ -284,17 +354,28 @@ def enrich_json_single_gpu(
 
         report_progress(
             progress_path, output_path, data, total, pending_total,
-            processed, failed, skipped, idx, started_at, save_every,
+            processed, failed, skipped, idx,
+            started_at, started_at_iso, previous_elapsed, save_every,
             f"{idx}/{pending_total}",
         )
 
-    write_progress_file(
+    final_progress = write_progress_file(
         progress_path, output_path, total, pending_total,
-        processed, failed, skipped, pending_total, started_at, status="done",
+        processed, failed, skipped, pending_total,
+        started_at, started_at_iso, previous_elapsed, status="done",
     )
+    data["transition_scoring_timing"] = {
+        k: final_progress[k] for k in (
+            "status", "started_at", "updated_at", "finished_at",
+            "elapsed_seconds_this_run", "accumulated_elapsed_seconds",
+            "elapsed_human", "elapsed_this_run_human",
+            "videos_per_second_this_run",
+        ) if k in final_progress
+    }
     print(
         f"[enrich] done -> {output_path} "
-        f"(processed={processed}, skipped={skipped}, failed={failed})"
+        f"(processed={processed}, skipped={skipped}, failed={failed}, "
+        f"elapsed={final_progress['elapsed_human']})"
     )
 
 
@@ -303,6 +384,8 @@ def enrich_json_multi_gpu(
     output_path: str,
     progress_path: str,
     started_at: float,
+    started_at_iso: str,
+    previous_elapsed: float,
     weights_path: str,
     gpu_ids: List[int],
     threshold: float,
@@ -324,14 +407,16 @@ def enrich_json_multi_gpu(
     if not pending:
         write_progress_file(
             progress_path, output_path, total, 0,
-            processed, failed, skipped, 0, started_at, status="done",
+            processed, failed, skipped, 0,
+            started_at, started_at_iso, previous_elapsed, status="done",
         )
         print(f"[enrich] nothing to do (skipped={skipped}, failed={failed})", flush=True)
         return
 
     write_progress_file(
         progress_path, output_path, total, pending_total,
-        processed, failed, skipped, 0, started_at, status="running",
+        processed, failed, skipped, 0,
+        started_at, started_at_iso, previous_elapsed, status="running",
     )
 
     ctx = multiprocessing.get_context("spawn")
@@ -362,20 +447,31 @@ def enrich_json_multi_gpu(
 
         report_progress(
             progress_path, output_path, data, total, pending_total,
-            processed, failed, skipped, idx, started_at, save_every,
+            processed, failed, skipped, idx,
+            started_at, started_at_iso, previous_elapsed, save_every,
             f"{idx}/{pending_total}",
         )
 
     for proc in workers:
         proc.join()
 
-    write_progress_file(
+    final_progress = write_progress_file(
         progress_path, output_path, total, pending_total,
-        processed, failed, skipped, pending_total, started_at, status="done",
+        processed, failed, skipped, pending_total,
+        started_at, started_at_iso, previous_elapsed, status="done",
     )
+    data["transition_scoring_timing"] = {
+        k: final_progress[k] for k in (
+            "status", "started_at", "updated_at", "finished_at",
+            "elapsed_seconds_this_run", "accumulated_elapsed_seconds",
+            "elapsed_human", "elapsed_this_run_human",
+            "videos_per_second_this_run",
+        ) if k in final_progress
+    }
     print(
         f"[enrich] done -> {output_path} "
-        f"(processed={processed}, skipped={skipped}, failed={failed})"
+        f"(processed={processed}, skipped={skipped}, failed={failed}, "
+        f"elapsed={final_progress['elapsed_human']})"
     )
 
 
@@ -410,9 +506,13 @@ def enrich_json(
 
     total = len(data.get("videos", {}))
     progress_path = progress_path_for(output_path)
+    previous_elapsed = load_previous_elapsed(progress_path, resume)
     started_at = time.time()
+    started_at_iso = datetime.now(timezone.utc).isoformat()
     print(f"[enrich] {source_path} -> {output_path} ({total} videos)")
     print(f"[enrich] progress file: {progress_path}")
+    if previous_elapsed > 0:
+        print(f"[enrich] previous elapsed: {format_duration(previous_elapsed)}")
 
     if gpu_ids and len(gpu_ids) > 1:
         enrich_json_multi_gpu(
@@ -420,6 +520,8 @@ def enrich_json(
             output_path=output_path,
             progress_path=progress_path,
             started_at=started_at,
+            started_at_iso=started_at_iso,
+            previous_elapsed=previous_elapsed,
             weights_path=weights_path,
             gpu_ids=gpu_ids,
             threshold=threshold,
@@ -436,6 +538,8 @@ def enrich_json(
             output_path=output_path,
             progress_path=progress_path,
             started_at=started_at,
+            started_at_iso=started_at_iso,
+            previous_elapsed=previous_elapsed,
             predictor=predictor,
             threshold=threshold,
             default_max_frames=default_max_frames,
@@ -538,6 +642,9 @@ def main():
     else:
         print(f"[enrich] weights: {weights_path}, device: {args.device or 'auto'}")
 
+    job_started = time.time()
+    job_started_iso = datetime.now(timezone.utc).isoformat()
+
     for input_path in json_files:
         if not os.path.isfile(input_path):
             print(f"[enrich] skip missing file: {input_path}", file=sys.stderr)
@@ -551,7 +658,7 @@ def main():
             os.makedirs(out_dir, exist_ok=True)
             output_path = os.path.join(out_dir, f"{base}{args.suffix}{ext}")
 
-        started = time.time()
+        file_started = time.time()
         enrich_json(
             input_path=input_path,
             output_path=output_path,
@@ -563,7 +670,31 @@ def main():
             gpu_ids=gpu_ids,
             device=args.device,
         )
-        print(f"[enrich] elapsed: {time.time() - started:.1f}s")
+        file_elapsed = time.time() - file_started
+        print(
+            f"[enrich] file elapsed: {format_duration(file_elapsed)} "
+            f"({round(file_elapsed, 1)}s) -> {output_path}"
+        )
+
+    total_elapsed = time.time() - job_started
+    timing_summary_path = os.path.join(
+        _SCRIPT_DIR, "logs", "enrich_timing_summary.json"
+    )
+    os.makedirs(os.path.dirname(timing_summary_path), exist_ok=True)
+    timing_summary = {
+        "job_started_at": job_started_iso,
+        "job_finished_at": datetime.now(timezone.utc).isoformat(),
+        "total_elapsed_seconds": round(total_elapsed, 1),
+        "total_elapsed_human": format_duration(total_elapsed),
+        "json_files": json_files,
+        "gpu_ids": gpu_ids,
+    }
+    atomic_write_json(timing_summary, timing_summary_path)
+    print(
+        f"[enrich] all files done in {format_duration(total_elapsed)} "
+        f"({round(total_elapsed, 1)}s)"
+    )
+    print(f"[enrich] timing summary: {timing_summary_path}")
 
 
 if __name__ == "__main__":

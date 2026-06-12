@@ -16,7 +16,8 @@ if [[ ! -f "$WEIGHTS" ]]; then
 fi
 
 echo "Logging to ${LOG}"
-echo "Check progress: python ${SCRIPT_DIR}/check_enrich_progress.py"
+echo "Check progress/time: python ${SCRIPT_DIR}/check_enrich_progress.py"
+echo "Timing summary:      ${LOG_DIR}/enrich_timing_summary.json"
 echo "Or: tail -f ${LOG}"
 
 python "${SCRIPT_DIR}/enrich_json_transitions.py" \

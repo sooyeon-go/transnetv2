@@ -11,19 +11,9 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from enrich_json_transitions import DEFAULT_JSON_FILES, progress_path_for
+from enrich_json_transitions import DEFAULT_JSON_FILES, format_duration, progress_path_for
 
-
-def format_eta(seconds):
-    if seconds is None:
-        return "unknown"
-    hours, rem = divmod(int(seconds), 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
+_SCRIPT_LOGS = os.path.join(_SCRIPT_DIR, "logs", "enrich_timing_summary.json")
 
 
 def load_progress(json_path: str):
@@ -45,8 +35,9 @@ def load_progress(json_path: str):
         return None, progress_path
 
     finished = scored + errors
+    timing = data.get("transition_scoring_timing", {})
     return {
-        "status": "done" if finished >= total else "unknown",
+        "status": timing.get("status", "done" if finished >= total else "unknown"),
         "json_path": json_path,
         "total_videos": total,
         "finished_total": finished,
@@ -54,6 +45,11 @@ def load_progress(json_path: str):
         "percent_total": round(finished / total * 100, 2) if total else 100.0,
         "processed_this_run": scored,
         "failed_this_run": errors,
+        "started_at": timing.get("started_at"),
+        "finished_at": timing.get("finished_at"),
+        "elapsed_human": timing.get("elapsed_human"),
+        "accumulated_elapsed_seconds": timing.get("accumulated_elapsed_seconds"),
+        "videos_per_second_this_run": timing.get("videos_per_second_this_run"),
         "note": "derived from JSON aggregate fields (no .progress.json found)",
     }, progress_path
 
@@ -62,6 +58,10 @@ def print_progress(info: dict, progress_path: str) -> None:
     print(f"JSON:     {info.get('json_path')}")
     print(f"Progress: {progress_path} ({'found' if os.path.isfile(progress_path) else 'missing'})")
     print(f"Status:   {info.get('status')}")
+    if info.get("started_at"):
+        print(f"Started:  {info['started_at']}")
+    if info.get("finished_at"):
+        print(f"Finished: {info['finished_at']}")
     if info.get("updated_at"):
         print(f"Updated:  {info['updated_at']}")
     print(
@@ -80,12 +80,21 @@ def print_progress(info: dict, progress_path: str) -> None:
         f"failed={info.get('failed_this_run', info.get('failed', '?'))}, "
         f"skipped={info.get('skipped_existing', info.get('skipped', 0))}"
     )
-    if info.get("videos_per_second"):
-        print(f"Speed:    {info['videos_per_second']} videos/sec")
-    if info.get("elapsed_seconds") is not None:
-        print(f"Elapsed:  {format_eta(info['elapsed_seconds'])}")
-    if info.get("eta_seconds") is not None and info.get("status") == "running":
-        print(f"ETA:      {format_eta(info['eta_seconds'])}")
+    speed = info.get("videos_per_second_this_run", info.get("videos_per_second"))
+    if speed:
+        print(f"Speed:    {speed} videos/sec")
+    if info.get("elapsed_human"):
+        print(f"Elapsed:  {info['elapsed_human']}")
+    elif info.get("accumulated_elapsed_seconds") is not None:
+        print(f"Elapsed:  {format_duration(info['accumulated_elapsed_seconds'])}")
+    elif info.get("elapsed_seconds") is not None:
+        print(f"Elapsed:  {format_duration(info['elapsed_seconds'])}")
+    if info.get("elapsed_this_run_human"):
+        print(f"This run: {info['elapsed_this_run_human']}")
+    if info.get("eta_human") and info.get("status") == "running":
+        print(f"ETA:      {info['eta_human']}")
+    elif info.get("eta_seconds") is not None and info.get("status") == "running":
+        print(f"ETA:      {format_duration(info['eta_seconds'])}")
     if info.get("note"):
         print(f"Note:     {info['note']}")
     print()
@@ -118,6 +127,15 @@ def main():
                 print(f"Progress: {progress_path} (no progress data yet)\n")
                 continue
             print_progress(info, progress_path)
+
+        if os.path.isfile(_SCRIPT_LOGS):
+            with open(_SCRIPT_LOGS) as f:
+                summary = json.load(f)
+            print(
+                f"Job total: {summary.get('total_elapsed_human', '?')} "
+                f"(started {summary.get('job_started_at', '?')})"
+            )
+            print()
 
         if not args.watch:
             break
