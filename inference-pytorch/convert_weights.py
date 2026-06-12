@@ -8,6 +8,12 @@ import transnetv2_pytorch
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_TF_WEIGHTS = os.path.normpath(
+    os.path.join(_SCRIPT_DIR, "..", "inference", "transnetv2-weights")
+)
+_DEFAULT_OUTPUT = os.path.join(_SCRIPT_DIR, "transnetv2-pytorch-weights.pth")
+
 
 def remap_name(x):
     x = x.replace("TransNet/", "")
@@ -111,15 +117,33 @@ def test_models(torch_model, tf_model):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tf_weights", type=str, help="path to TransNet V2 weights",
-                        default="../inference/transnetv2-weights/")
+    parser.add_argument(
+        "--tf_weights", type=str, default=_DEFAULT_TF_WEIGHTS,
+        help=f"path to TransNet V2 TF weights (default: {_DEFAULT_TF_WEIGHTS})",
+    )
+    parser.add_argument(
+        "--output", type=str, default=_DEFAULT_OUTPUT,
+        help=f"path to save PyTorch weights (default: {_DEFAULT_OUTPUT})",
+    )
     parser.add_argument('--test', action="store_true", help="run tests")
     args = parser.parse_args()
 
-    torch_model, tf_model = convert_weights(args.tf_weights)
+    tf_weights = os.path.abspath(args.tf_weights)
+    saved_model_pb = os.path.join(tf_weights, "saved_model.pb")
+    if not os.path.isfile(saved_model_pb):
+        raise FileNotFoundError(
+            f"TF weights not found: {saved_model_pb}\n"
+            f"Expected directory: {tf_weights}\n"
+            "Download weights with:\n"
+            f"  cd {os.path.normpath(os.path.join(_SCRIPT_DIR, '..'))} && git lfs pull"
+        )
 
-    print("Saving model to ./transnetv2-pytorch-weights.pth")
-    torch.save(torch_model.state_dict(), "./transnetv2-pytorch-weights.pth")
+    print(f"Loading TF weights from {tf_weights}")
+    torch_model, tf_model = convert_weights(tf_weights)
+
+    output_path = os.path.abspath(args.output)
+    print(f"Saving model to {output_path}")
+    torch.save(torch_model.state_dict(), output_path)
 
     if args.test:
         test_models(torch_model, tf_model)

@@ -29,7 +29,8 @@ echo "==> PyTorch 1.7.1 + CUDA 10.1 설치"
 conda install pytorch=1.7.1 cudatoolkit=10.1 -c pytorch -y
 
 echo "==> 가중치 변환 및 inference용 pip 패키지 설치"
-pip install --no-cache-dir "tensorflow==2.1" numpy ffmpeg-python
+# TF 2.1은 protobuf 4.x와 호환되지 않음 (convert_weights.py용, inference에는 TF 불필요)
+pip install --no-cache-dir "tensorflow==2.1" "protobuf==3.19.6" numpy ffmpeg-python
 
 echo
 echo "환경 생성 완료."
