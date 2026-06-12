@@ -5,11 +5,15 @@ import argparse
 import json
 import multiprocessing
 import os
+import queue
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+WORKER_INIT_FAILED = "__worker_init_failed__"
+WORKER_READY = "__worker_ready__"
 
 import numpy as np
 
@@ -249,14 +253,22 @@ def _gpu_worker(
     task_queue,
     result_queue,
 ) -> None:
-    if _SCRIPT_DIR not in sys.path:
-        sys.path.insert(0, _SCRIPT_DIR)
+    try:
+        if _SCRIPT_DIR not in sys.path:
+            sys.path.insert(0, _SCRIPT_DIR)
 
-    predictor = TransNetV2Predictor(
-        weights_path=weights_path,
-        device=f"cuda:{gpu_id}",
-    )
-    print(f"[enrich] worker started on GPU {gpu_id}", flush=True)
+        from transnetv2_infer import TransNetV2Predictor
+
+        predictor = TransNetV2Predictor(
+            weights_path=weights_path,
+            device=f"cuda:{gpu_id}",
+        )
+        result_queue.put((WORKER_READY, gpu_id, None))
+        print(f"[enrich] worker started on GPU {gpu_id}", flush=True)
+    except Exception as exc:
+        result_queue.put((WORKER_INIT_FAILED, gpu_id, str(exc)))
+        print(f"[enrich] worker failed on GPU {gpu_id}: {exc}", flush=True)
+        return
 
     while True:
         task = task_queue.get()
@@ -269,6 +281,50 @@ def _gpu_worker(
             result_queue.put((video_key, result, None))
         except Exception as exc:
             result_queue.put((video_key, None, str(exc)))
+
+
+def wait_for_workers(result_queue, workers, gpu_ids, timeout: int = 180) -> None:
+    failures = []
+    ready = 0
+    for _ in gpu_ids:
+        try:
+            token, gpu_id, error = result_queue.get(timeout=timeout)
+        except queue.Empty:
+            failures.append((None, f"worker startup timed out after {timeout}s"))
+            break
+        if token == WORKER_INIT_FAILED:
+            failures.append((gpu_id, error))
+        elif token == WORKER_READY:
+            ready += 1
+        else:
+            failures.append((gpu_id, f"unexpected worker message: {token}"))
+
+    dead = [idx for idx, proc in enumerate(workers) if not proc.is_alive()]
+    if failures or ready != len(gpu_ids) or dead:
+        details = []
+        for gpu_id, msg in failures:
+            details.append(f"GPU {gpu_id}: {msg}")
+        for idx in dead:
+            details.append(f"worker process {idx} exited early (exit={workers[idx].exitcode})")
+        raise RuntimeError(
+            "Failed to start GPU workers.\n"
+            + "\n".join(details)
+            + "\nH200/H100 requires PyTorch 2.x. Run: bash setup_conda_env_infer.sh"
+        )
+
+
+def get_worker_result(result_queue, workers, timeout: int = 300):
+    try:
+        return result_queue.get(timeout=timeout)
+    except queue.Empty:
+        dead = [proc.exitcode for proc in workers if not proc.is_alive()]
+        if dead:
+            raise RuntimeError(
+                f"GPU worker died (exit codes={dead}). "
+                "Likely PyTorch/CUDA mismatch on H200. "
+                "Use: bash setup_conda_env_infer.sh"
+            )
+        raise RuntimeError(f"No worker response for {timeout}s")
 
 
 def apply_result(entry: Dict[str, Any], result: Optional[Dict[str, Any]], error: Optional[str]) -> bool:
@@ -437,8 +493,10 @@ def enrich_json_multi_gpu(
         proc.start()
         workers.append(proc)
 
+    wait_for_workers(result_queue, workers, gpu_ids)
+
     for idx in range(1, pending_total + 1):
-        video_key, result, error = result_queue.get()
+        video_key, result, error = get_worker_result(result_queue, workers)
         entry = videos[video_key]
         if apply_result(entry, result, error):
             processed += 1

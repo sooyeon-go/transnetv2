@@ -11,6 +11,36 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WEIGHTS_PATH = os.path.join(_SCRIPT_DIR, "transnetv2-pytorch-weights.pth")
 
 
+def load_weights(weights_path: str, device: torch.device):
+    try:
+        return torch.load(weights_path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(weights_path, map_location=device)
+
+
+def verify_torch_device(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False")
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    name = torch.cuda.get_device_name(index)
+    capability = torch.cuda.get_device_capability(index)
+
+    try:
+        torch.zeros(1, device=device)
+    except Exception as exc:
+        raise RuntimeError(
+            f"GPU {index} ({name}, sm_{capability[0]}{capability[1]}) is not usable with "
+            f"PyTorch {torch.__version__}.\n"
+            "NVIDIA H200/H100 (sm_90) needs PyTorch 2.1+ with CUDA 12.\n"
+            "Create a new env: bash setup_conda_env_infer.sh\n"
+            "Then: conda activate transnetv2-infer && ./run_enrich_json.sh"
+        ) from exc
+
+
 class TransNetV2Predictor:
 
     _input_size = (27, 48, 3)
@@ -28,9 +58,11 @@ class TransNetV2Predictor:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
+        verify_torch_device(self.device)
 
         self.model = TransNetV2()
-        self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
+        state_dict = load_weights(weights_path, self.device)
+        self.model.load_state_dict(state_dict)
         self.model.eval().to(self.device)
         print(f"[TransNetV2] Using weights from {weights_path} ({self.device}).")
 

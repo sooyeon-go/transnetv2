@@ -15,6 +15,41 @@ if [[ ! -f "$WEIGHTS" ]]; then
     exit 1
 fi
 
+echo "Checking GPU/PyTorch compatibility..."
+export SCRIPT_DIR
+if ! python - <<'PY'
+import os
+import sys
+import torch
+
+script_dir = os.environ["SCRIPT_DIR"]
+
+if not torch.cuda.is_available():
+    print("WARNING: CUDA not available, will run on CPU (very slow).", file=sys.stderr)
+    sys.exit(0)
+
+idx = 5 if torch.cuda.device_count() > 5 else 0
+name = torch.cuda.get_device_name(idx)
+cap = torch.cuda.get_device_capability(idx)
+print(f"PyTorch {torch.__version__}, test GPU {idx}: {name} (sm_{cap[0]}{cap[1]})")
+try:
+    torch.zeros(1, device=f"cuda:{idx}")
+except Exception as exc:
+    print(
+        f"ERROR: GPU {idx} not usable with PyTorch {torch.__version__}: {exc}\n"
+        "H200/H100 needs PyTorch 2.x. Run:\n"
+        f"  bash {script_dir}/setup_conda_env_infer.sh\n"
+        "  conda activate transnetv2-infer\n"
+        f"  bash {script_dir}/run_enrich_json.sh",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print("GPU check: OK")
+PY
+then
+    exit 1
+fi
+
 echo "Logging to ${LOG}"
 echo "Check progress/time: python ${SCRIPT_DIR}/check_enrich_progress.py"
 echo "Timing summary:      ${LOG_DIR}/enrich_timing_summary.json"
