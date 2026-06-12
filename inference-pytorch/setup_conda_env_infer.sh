@@ -6,6 +6,7 @@ set -euo pipefail
 
 ENV_NAME="${1:-transnetv2-infer}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
+TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 
 if ! command -v conda &>/dev/null; then
     echo "Error: conda가 설치되어 있지 않습니다." >&2
@@ -14,6 +15,7 @@ fi
 
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
     echo "Error: conda 환경 '$ENV_NAME'이(가) 이미 존재합니다." >&2
+    echo "복구하려면: bash $(dirname "$0")/fix_transnetv2_infer_env.sh" >&2
     exit 1
 fi
 
@@ -24,13 +26,14 @@ conda create -n "$ENV_NAME" "python=$PYTHON_VERSION" -y
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
-echo "==> PyTorch 2.x + CUDA 12 설치 (H200 sm_90 지원)"
-conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia -y
+echo "==> PyTorch 2.x + CUDA 12.4 설치 (pip wheel, H200 sm_90 지원)"
+echo "    index: ${TORCH_INDEX}"
+pip install --no-cache-dir torch torchvision torchaudio --index-url "${TORCH_INDEX}"
 
-echo "==> inference용 pip 패키지 설치"
-pip install --no-cache-dir numpy ffmpeg-python
+echo "==> inference용 패키지 설치"
+pip install --no-cache-dir "numpy<2.3" ffmpeg-python
 
-echo
+echo "==> import 테스트"
 python - <<'PY'
 import torch
 print("torch:", torch.__version__)
