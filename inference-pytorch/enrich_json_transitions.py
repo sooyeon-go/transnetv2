@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -92,6 +93,88 @@ def atomic_write_json(data: Dict[str, Any], output_path: str) -> None:
     os.replace(tmp_path, output_path)
 
 
+def progress_path_for(output_path: str) -> str:
+    return output_path + ".progress.json"
+
+
+def write_progress_file(
+    progress_path: str,
+    output_path: str,
+    total: int,
+    pending_total: int,
+    processed: int,
+    failed: int,
+    skipped: int,
+    done_in_batch: int,
+    started_at: float,
+    status: str = "running",
+) -> None:
+    finished = skipped + processed + failed
+    percent = (finished / total * 100.0) if total else 100.0
+    batch_percent = (done_in_batch / pending_total * 100.0) if pending_total else 100.0
+    elapsed = max(time.time() - started_at, 1e-6)
+    rate = done_in_batch / elapsed
+    remaining = pending_total - done_in_batch
+    eta_seconds = int(remaining / rate) if rate > 0 else None
+
+    payload = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "json_path": output_path,
+        "total_videos": total,
+        "pending_this_run": pending_total,
+        "done_this_run": done_in_batch,
+        "processed_this_run": processed,
+        "failed_this_run": failed,
+        "skipped_existing": skipped,
+        "finished_total": finished,
+        "remaining_total": max(total - finished, 0),
+        "percent_total": round(percent, 2),
+        "percent_this_run": round(batch_percent, 2),
+        "videos_per_second": round(rate, 3),
+        "elapsed_seconds": int(elapsed),
+        "eta_seconds": eta_seconds,
+    }
+    atomic_write_json(payload, progress_path)
+
+
+def report_progress(
+    progress_path: str,
+    output_path: str,
+    data: Dict[str, Any],
+    total: int,
+    pending_total: int,
+    processed: int,
+    failed: int,
+    skipped: int,
+    done_in_batch: int,
+    started_at: float,
+    save_every: int,
+    label: str,
+    status: str = "running",
+) -> None:
+    write_progress_file(
+        progress_path, output_path, total, pending_total,
+        processed, failed, skipped, done_in_batch, started_at, status=status,
+    )
+
+    if done_in_batch % 100 != 0 and done_in_batch != pending_total:
+        return
+
+    print(
+        f"[enrich] progress {label} "
+        f"run={done_in_batch}/{pending_total}, "
+        f"total={skipped + processed + failed}/{total}, "
+        f"processed={processed}, skipped={skipped}, failed={failed}",
+        flush=True,
+    )
+
+    if save_every > 0 and (processed + failed) % save_every == 0:
+        update_aggregate(data)
+        atomic_write_json(data, output_path)
+        print(f"[enrich] checkpoint saved -> {output_path}", flush=True)
+
+
 def _gpu_worker(
     gpu_id: int,
     weights_path: str,
@@ -164,33 +247,11 @@ def collect_pending_tasks(
     return pending, skipped, failed
 
 
-def maybe_checkpoint(
-    data: Dict[str, Any],
-    output_path: str,
-    processed: int,
-    failed: int,
-    skipped: int,
-    total: int,
-    save_every: int,
-    label: str,
-) -> None:
-    if save_every <= 0:
-        return
-    if (processed + failed) % save_every != 0:
-        return
-
-    update_aggregate(data)
-    atomic_write_json(data, output_path)
-    print(
-        f"[enrich] checkpoint {label} "
-        f"(processed={processed}, skipped={skipped}, failed={failed}, total={total})",
-        flush=True,
-    )
-
-
 def enrich_json_single_gpu(
     data: Dict[str, Any],
     output_path: str,
+    progress_path: str,
+    started_at: float,
     predictor: TransNetV2Predictor,
     threshold: float,
     default_max_frames: Optional[int],
@@ -201,8 +262,13 @@ def enrich_json_single_gpu(
     total = len(videos)
     pending, skipped, failed = collect_pending_tasks(videos, resume, default_max_frames)
     processed = 0
+    pending_total = len(pending)
 
-    print(f"[enrich] single-GPU mode ({len(pending)} videos to score)", flush=True)
+    print(f"[enrich] single-GPU mode ({pending_total} videos to score)", flush=True)
+    write_progress_file(
+        progress_path, output_path, total, pending_total,
+        processed, failed, skipped, 0, started_at, status="running",
+    )
 
     for idx, (video_key, video_path, max_frames) in enumerate(pending, start=1):
         entry = videos[video_key]
@@ -216,18 +282,16 @@ def enrich_json_single_gpu(
             apply_result(entry, None, str(exc))
             failed += 1
 
-        maybe_checkpoint(
-            data, output_path, processed, failed, skipped, total, save_every,
-            f"{idx}/{len(pending)}",
+        report_progress(
+            progress_path, output_path, data, total, pending_total,
+            processed, failed, skipped, idx, started_at, save_every,
+            f"{idx}/{pending_total}",
         )
 
-        if idx % 100 == 0 or idx == len(pending):
-            print(
-                f"[enrich] progress {idx}/{len(pending)} "
-                f"(processed={processed}, skipped={skipped}, failed={failed})",
-                flush=True,
-            )
-
+    write_progress_file(
+        progress_path, output_path, total, pending_total,
+        processed, failed, skipped, pending_total, started_at, status="done",
+    )
     print(
         f"[enrich] done -> {output_path} "
         f"(processed={processed}, skipped={skipped}, failed={failed})"
@@ -237,6 +301,8 @@ def enrich_json_single_gpu(
 def enrich_json_multi_gpu(
     data: Dict[str, Any],
     output_path: str,
+    progress_path: str,
+    started_at: float,
     weights_path: str,
     gpu_ids: List[int],
     threshold: float,
@@ -248,15 +314,25 @@ def enrich_json_multi_gpu(
     total = len(videos)
     pending, skipped, failed = collect_pending_tasks(videos, resume, default_max_frames)
     processed = 0
+    pending_total = len(pending)
 
     print(
-        f"[enrich] multi-GPU mode gpus={gpu_ids} ({len(pending)} videos to score)",
+        f"[enrich] multi-GPU mode gpus={gpu_ids} ({pending_total} videos to score)",
         flush=True,
     )
 
     if not pending:
+        write_progress_file(
+            progress_path, output_path, total, 0,
+            processed, failed, skipped, 0, started_at, status="done",
+        )
         print(f"[enrich] nothing to do (skipped={skipped}, failed={failed})", flush=True)
         return
+
+    write_progress_file(
+        progress_path, output_path, total, pending_total,
+        processed, failed, skipped, 0, started_at, status="running",
+    )
 
     ctx = multiprocessing.get_context("spawn")
     task_queue = ctx.Queue()
@@ -276,7 +352,7 @@ def enrich_json_multi_gpu(
         proc.start()
         workers.append(proc)
 
-    for idx in range(1, len(pending) + 1):
+    for idx in range(1, pending_total + 1):
         video_key, result, error = result_queue.get()
         entry = videos[video_key]
         if apply_result(entry, result, error):
@@ -284,21 +360,19 @@ def enrich_json_multi_gpu(
         else:
             failed += 1
 
-        maybe_checkpoint(
-            data, output_path, processed, failed, skipped, total, save_every,
-            f"{idx}/{len(pending)}",
+        report_progress(
+            progress_path, output_path, data, total, pending_total,
+            processed, failed, skipped, idx, started_at, save_every,
+            f"{idx}/{pending_total}",
         )
-
-        if idx % 100 == 0 or idx == len(pending):
-            print(
-                f"[enrich] progress {idx}/{len(pending)} "
-                f"(processed={processed}, skipped={skipped}, failed={failed})",
-                flush=True,
-            )
 
     for proc in workers:
         proc.join()
 
+    write_progress_file(
+        progress_path, output_path, total, pending_total,
+        processed, failed, skipped, pending_total, started_at, status="done",
+    )
     print(
         f"[enrich] done -> {output_path} "
         f"(processed={processed}, skipped={skipped}, failed={failed})"
@@ -335,12 +409,17 @@ def enrich_json(
         data["transition_gpu_ids"] = gpu_ids
 
     total = len(data.get("videos", {}))
+    progress_path = progress_path_for(output_path)
+    started_at = time.time()
     print(f"[enrich] {source_path} -> {output_path} ({total} videos)")
+    print(f"[enrich] progress file: {progress_path}")
 
     if gpu_ids and len(gpu_ids) > 1:
         enrich_json_multi_gpu(
             data=data,
             output_path=output_path,
+            progress_path=progress_path,
+            started_at=started_at,
             weights_path=weights_path,
             gpu_ids=gpu_ids,
             threshold=threshold,
@@ -355,6 +434,8 @@ def enrich_json(
         enrich_json_single_gpu(
             data=data,
             output_path=output_path,
+            progress_path=progress_path,
+            started_at=started_at,
             predictor=predictor,
             threshold=threshold,
             default_max_frames=default_max_frames,
