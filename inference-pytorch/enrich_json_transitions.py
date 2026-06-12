@@ -3,14 +3,35 @@
 
 import argparse
 import json
+import multiprocessing
 import os
 import sys
+import tempfile
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from transnetv2_infer import TransNetV2Predictor
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from transnetv2_infer import DEFAULT_WEIGHTS_PATH, TransNetV2Predictor
+
+DEFAULT_JSON_FILES = [
+    "/data/project-vilab/sy/optical_flow_metric/output/result50k.json",
+    "/data/project-vilab/sy/optical_flow_metric/output/result_50k_150k.json",
+]
+DEFAULT_GPU_IDS = [5, 6, 7]
+
+
+def parse_gpu_ids(gpus_arg: Optional[str]) -> Optional[List[int]]:
+    if gpus_arg is None:
+        return None
+    gpu_ids = [int(x.strip()) for x in gpus_arg.split(",") if x.strip()]
+    if not gpu_ids:
+        raise ValueError("empty --gpus value")
+    return gpu_ids
 
 
 def resolve_max_frames(entry: Dict[str, Any], cli_default: Optional[int]) -> Optional[int]:
@@ -62,32 +83,66 @@ def update_aggregate(data: Dict[str, Any]) -> None:
         data.pop("aggregate_mean_transition_count", None)
 
 
-def enrich_json(
-    input_path: str,
-    output_path: str,
-    predictor: TransNetV2Predictor,
+def atomic_write_json(data: Dict[str, Any], output_path: str) -> None:
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=out_dir, delete=False) as tmp:
+        json.dump(data, tmp, indent=2)
+        tmp_path = tmp.name
+    os.replace(tmp_path, output_path)
+
+
+def _gpu_worker(
+    gpu_id: int,
+    weights_path: str,
     threshold: float,
-    default_max_frames: Optional[int],
-    resume: bool,
-    save_every: int,
+    task_queue,
+    result_queue,
 ) -> None:
-    source_path = input_path
-    if resume and os.path.isfile(output_path) and not os.path.samefile(input_path, output_path):
-        source_path = output_path
-        print(f"[enrich] resuming from existing output: {output_path}")
+    if _SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPT_DIR)
 
-    with open(source_path) as f:
-        data = json.load(f)
+    predictor = TransNetV2Predictor(
+        weights_path=weights_path,
+        device=f"cuda:{gpu_id}",
+    )
+    print(f"[enrich] worker started on GPU {gpu_id}", flush=True)
 
-    videos = data.get("videos", {})
-    total = len(videos)
-    processed = 0
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+
+        video_key, video_path, max_frames = task
+        try:
+            result = score_video(predictor, video_path, max_frames, threshold)
+            result_queue.put((video_key, result, None))
+        except Exception as exc:
+            result_queue.put((video_key, None, str(exc)))
+
+
+def apply_result(entry: Dict[str, Any], result: Optional[Dict[str, Any]], error: Optional[str]) -> bool:
+    if error:
+        entry["transition_error"] = error
+        entry.pop("transition_count", None)
+        entry.pop("transition_details", None)
+        return False
+
+    entry.update(result)
+    entry.pop("transition_error", None)
+    return True
+
+
+def collect_pending_tasks(
+    videos: Dict[str, Any],
+    resume: bool,
+    default_max_frames: Optional[int],
+) -> Tuple[List[Tuple[str, str, Optional[int]]], int, int]:
+    pending = []
     skipped = 0
     failed = 0
 
-    print(f"[enrich] {input_path}: {total} videos")
-
-    for idx, (video_key, entry) in enumerate(videos.items(), start=1):
+    for video_key, entry in videos.items():
         if resume and "transition_count" in entry and not entry.get("transition_error"):
             skipped += 1
             continue
@@ -104,42 +159,219 @@ def enrich_json(
             continue
 
         max_frames = resolve_max_frames(entry, default_max_frames)
+        pending.append((video_key, video_path, max_frames))
 
+    return pending, skipped, failed
+
+
+def maybe_checkpoint(
+    data: Dict[str, Any],
+    output_path: str,
+    processed: int,
+    failed: int,
+    skipped: int,
+    total: int,
+    save_every: int,
+    label: str,
+) -> None:
+    if save_every <= 0:
+        return
+    if (processed + failed) % save_every != 0:
+        return
+
+    update_aggregate(data)
+    atomic_write_json(data, output_path)
+    print(
+        f"[enrich] checkpoint {label} "
+        f"(processed={processed}, skipped={skipped}, failed={failed}, total={total})",
+        flush=True,
+    )
+
+
+def enrich_json_single_gpu(
+    data: Dict[str, Any],
+    output_path: str,
+    predictor: TransNetV2Predictor,
+    threshold: float,
+    default_max_frames: Optional[int],
+    resume: bool,
+    save_every: int,
+) -> None:
+    videos = data.get("videos", {})
+    total = len(videos)
+    pending, skipped, failed = collect_pending_tasks(videos, resume, default_max_frames)
+    processed = 0
+
+    print(f"[enrich] single-GPU mode ({len(pending)} videos to score)", flush=True)
+
+    for idx, (video_key, video_path, max_frames) in enumerate(pending, start=1):
+        entry = videos[video_key]
         try:
             result = score_video(predictor, video_path, max_frames, threshold)
-            entry.update(result)
-            entry.pop("transition_error", None)
-            processed += 1
+            if apply_result(entry, result, None):
+                processed += 1
+            else:
+                failed += 1
         except Exception as exc:
-            entry["transition_error"] = str(exc)
-            entry.pop("transition_count", None)
-            entry.pop("transition_details", None)
+            apply_result(entry, None, str(exc))
             failed += 1
 
-        if save_every > 0 and (processed + failed) % save_every == 0:
-            update_aggregate(data)
-            with open(output_path, "w") as f:
-                json.dump(data, f, indent=2)
-            print(
-                f"[enrich] checkpoint {idx}/{total} "
-                f"(processed={processed}, skipped={skipped}, failed={failed})"
-            )
+        maybe_checkpoint(
+            data, output_path, processed, failed, skipped, total, save_every,
+            f"{idx}/{len(pending)}",
+        )
 
-        if idx % 100 == 0 or idx == total:
+        if idx % 100 == 0 or idx == len(pending):
             print(
-                f"[enrich] progress {idx}/{total} "
+                f"[enrich] progress {idx}/{len(pending)} "
                 f"(processed={processed}, skipped={skipped}, failed={failed})",
                 flush=True,
             )
-
-    update_aggregate(data)
-    with open(output_path, "w") as f:
-        json.dump(data, f, indent=2)
 
     print(
         f"[enrich] done -> {output_path} "
         f"(processed={processed}, skipped={skipped}, failed={failed})"
     )
+
+
+def enrich_json_multi_gpu(
+    data: Dict[str, Any],
+    output_path: str,
+    weights_path: str,
+    gpu_ids: List[int],
+    threshold: float,
+    default_max_frames: Optional[int],
+    resume: bool,
+    save_every: int,
+) -> None:
+    videos = data.get("videos", {})
+    total = len(videos)
+    pending, skipped, failed = collect_pending_tasks(videos, resume, default_max_frames)
+    processed = 0
+
+    print(
+        f"[enrich] multi-GPU mode gpus={gpu_ids} ({len(pending)} videos to score)",
+        flush=True,
+    )
+
+    if not pending:
+        print(f"[enrich] nothing to do (skipped={skipped}, failed={failed})", flush=True)
+        return
+
+    ctx = multiprocessing.get_context("spawn")
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+
+    for task in pending:
+        task_queue.put(task)
+    for _ in gpu_ids:
+        task_queue.put(None)
+
+    workers = []
+    for gpu_id in gpu_ids:
+        proc = ctx.Process(
+            target=_gpu_worker,
+            args=(gpu_id, weights_path, threshold, task_queue, result_queue),
+        )
+        proc.start()
+        workers.append(proc)
+
+    for idx in range(1, len(pending) + 1):
+        video_key, result, error = result_queue.get()
+        entry = videos[video_key]
+        if apply_result(entry, result, error):
+            processed += 1
+        else:
+            failed += 1
+
+        maybe_checkpoint(
+            data, output_path, processed, failed, skipped, total, save_every,
+            f"{idx}/{len(pending)}",
+        )
+
+        if idx % 100 == 0 or idx == len(pending):
+            print(
+                f"[enrich] progress {idx}/{len(pending)} "
+                f"(processed={processed}, skipped={skipped}, failed={failed})",
+                flush=True,
+            )
+
+    for proc in workers:
+        proc.join()
+
+    print(
+        f"[enrich] done -> {output_path} "
+        f"(processed={processed}, skipped={skipped}, failed={failed})"
+    )
+
+
+def enrich_json(
+    input_path: str,
+    output_path: str,
+    weights_path: str,
+    threshold: float,
+    default_max_frames: Optional[int],
+    resume: bool,
+    save_every: int,
+    gpu_ids: Optional[List[int]] = None,
+    device: Optional[str] = None,
+) -> None:
+    source_path = input_path
+    if resume and os.path.isfile(output_path):
+        try:
+            same_file = os.path.samefile(input_path, output_path)
+        except FileNotFoundError:
+            same_file = False
+        if not same_file:
+            source_path = output_path
+            print(f"[enrich] resuming from existing output: {output_path}")
+
+    with open(source_path) as f:
+        data = json.load(f)
+
+    data["transition_weights_path"] = weights_path
+    data["transition_threshold"] = threshold
+    if gpu_ids:
+        data["transition_gpu_ids"] = gpu_ids
+
+    total = len(data.get("videos", {}))
+    print(f"[enrich] {source_path} -> {output_path} ({total} videos)")
+
+    if gpu_ids and len(gpu_ids) > 1:
+        enrich_json_multi_gpu(
+            data=data,
+            output_path=output_path,
+            weights_path=weights_path,
+            gpu_ids=gpu_ids,
+            threshold=threshold,
+            default_max_frames=default_max_frames,
+            resume=resume,
+            save_every=save_every,
+        )
+    else:
+        if gpu_ids:
+            device = f"cuda:{gpu_ids[0]}"
+        predictor = TransNetV2Predictor(weights_path=weights_path, device=device)
+        enrich_json_single_gpu(
+            data=data,
+            output_path=output_path,
+            predictor=predictor,
+            threshold=threshold,
+            default_max_frames=default_max_frames,
+            resume=resume,
+            save_every=save_every,
+        )
+
+    update_aggregate(data)
+    atomic_write_json(data, output_path)
+
+
+def resolve_json_files(json_files: Optional[List[str]], use_defaults: bool) -> List[str]:
+    if json_files:
+        return json_files
+    if use_defaults:
+        return list(DEFAULT_JSON_FILES)
+    raise SystemExit("No JSON files given. Pass paths or use --use-default-jsons.")
 
 
 def main():
@@ -148,8 +380,13 @@ def main():
     )
     parser.add_argument(
         "json_files",
-        nargs="+",
-        help="input JSON files (e.g. result50k.json result_50k_150k.json)",
+        nargs="*",
+        help="input JSON files (omit with --use-default-jsons for built-in paths)",
+    )
+    parser.add_argument(
+        "--use-default-jsons",
+        action="store_true",
+        help="use default OpenVid result JSON paths under /data/project-vilab/sy/optical_flow_metric/output/",
     )
     parser.add_argument(
         "--output-dir",
@@ -166,16 +403,32 @@ def main():
     parser.add_argument(
         "--inplace",
         action="store_true",
-        help="overwrite input JSON in place (use with care)",
+        help="overwrite input JSON in place (atomic write)",
     )
-    parser.add_argument("--weights", type=str, default=None, help="path to .pth weights")
-    parser.add_argument("--device", type=str, default=None, help="cuda or cpu")
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=DEFAULT_WEIGHTS_PATH,
+        help=f"path to .pth weights (default: {DEFAULT_WEIGHTS_PATH})",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help=f"comma-separated GPU ids for multi-GPU inference (e.g. 5,6,7; default in run script: {','.join(map(str, DEFAULT_GPU_IDS))})",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="single device for inference (e.g. cpu, cuda:0). ignored when --gpus has 2+ ids",
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
         "--max-frames",
         type=int,
         default=None,
-        help="default max frames if entry has no max_frames_limit (omit = full video)",
+        help="default max frames if entry has no max_frames_limit (omit = use per-entry value)",
     )
     parser.add_argument(
         "--resume",
@@ -190,9 +443,21 @@ def main():
     )
     args = parser.parse_args()
 
-    predictor = TransNetV2Predictor(weights_path=args.weights, device=args.device)
+    if args.gpus and args.device:
+        print("[enrich] warning: --device is ignored when --gpus is set", file=sys.stderr)
 
-    for input_path in args.json_files:
+    json_files = resolve_json_files(args.json_files, args.use_default_jsons)
+    weights_path = os.path.abspath(args.weights)
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"weights not found: {weights_path}")
+
+    gpu_ids = parse_gpu_ids(args.gpus)
+    if gpu_ids:
+        print(f"[enrich] weights: {weights_path}, gpus: {gpu_ids}")
+    else:
+        print(f"[enrich] weights: {weights_path}, device: {args.device or 'auto'}")
+
+    for input_path in json_files:
         if not os.path.isfile(input_path):
             print(f"[enrich] skip missing file: {input_path}", file=sys.stderr)
             continue
@@ -209,11 +474,13 @@ def main():
         enrich_json(
             input_path=input_path,
             output_path=output_path,
-            predictor=predictor,
+            weights_path=weights_path,
             threshold=args.threshold,
             default_max_frames=args.max_frames,
             resume=args.resume,
             save_every=args.save_every,
+            gpu_ids=gpu_ids,
+            device=args.device,
         )
         print(f"[enrich] elapsed: {time.time() - started:.1f}s")
 

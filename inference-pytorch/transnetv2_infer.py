@@ -7,6 +7,9 @@ import torch
 
 from transnetv2_pytorch import TransNetV2
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_WEIGHTS_PATH = os.path.join(_SCRIPT_DIR, "transnetv2-pytorch-weights.pth")
+
 
 class TransNetV2Predictor:
 
@@ -14,7 +17,8 @@ class TransNetV2Predictor:
 
     def __init__(self, weights_path=None, device=None):
         if weights_path is None:
-            weights_path = os.path.join(os.path.dirname(__file__), "transnetv2-pytorch-weights.pth")
+            weights_path = DEFAULT_WEIGHTS_PATH
+        weights_path = os.path.abspath(weights_path)
         if not os.path.isfile(weights_path):
             raise FileNotFoundError(
                 f"[TransNetV2] weights not found: {weights_path}\n"
@@ -135,7 +139,10 @@ class TransNetV2Predictor:
 def main():
     parser = argparse.ArgumentParser(description="TransNet V2 PyTorch inference")
     parser.add_argument("files", type=str, nargs="+", help="path to video files")
-    parser.add_argument("--weights", type=str, default=None, help="path to .pth weights")
+    parser.add_argument(
+        "--weights", type=str, default=DEFAULT_WEIGHTS_PATH,
+        help=f"path to .pth weights (default: {DEFAULT_WEIGHTS_PATH})",
+    )
     parser.add_argument("--device", type=str, default=None, help="cuda or cpu (default: auto)")
     parser.add_argument("--threshold", type=float, default=0.5, help="scene detection threshold")
     parser.add_argument("--full-output", action="store_true",

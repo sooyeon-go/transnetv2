@@ -46,5 +46,8 @@ echo "변환 후 생성되는 파일: transnetv2-pytorch-weights.pth"
 echo
 echo "비디오 inference (장면 전환 횟수 출력):"
 echo "  python transnetv2_infer.py /path/to/video.mp4"
-echo "  # stdout: video.mp4: 3"
-echo "  # 파일:   video.mp4.transition_count.txt  (내용: 0, 1, 2, ...)"
+echo
+echo "optical-flow JSON에 transition_count 추가:"
+echo "  ./run_enrich_json.sh"
+echo "  # 또는"
+echo "  python enrich_json_transitions.py --use-default-jsons --inplace --resume"
